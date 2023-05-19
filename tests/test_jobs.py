@@ -6,7 +6,7 @@ from dirty_equals import IsNow
 
 from arq import Worker, func
 from arq.connections import ArqRedis, RedisSettings, create_pool
-from arq.constants import default_queue_name, in_progress_key_prefix, job_key_prefix, result_key_prefix
+from arq.constants import default_queue_name, default_in_progress_key_suffix, default_job_key_suffix, default_result_key_suffix
 from arq.jobs import (
     DeserializationError,
     Job,
@@ -19,8 +19,10 @@ from arq.jobs import (
 
 
 async def test_job_in_progress(arq_redis: ArqRedis):
-    await arq_redis.set(in_progress_key_prefix + 'foobar', b'1')
+    await arq_redis.set(default_queue_name + default_in_progress_key_suffix + 'foobar', b'1')
     j = Job('foobar', arq_redis)
+    x = await arq_redis.all_job_results()
+    print(f"{x=}")
     assert JobStatus.in_progress == await j.status()
     assert str(j) == '<arq job foobar>'
 
@@ -72,10 +74,13 @@ async def test_enqueue_job(arq_redis: ArqRedis, worker, queue_name=default_queue
     assert JobStatus.queued == await j.status()
     worker: Worker = worker(functions=[func(foobar, name='foobar')], queue_name=queue_name)
     await worker.main()
+    x = await arq_redis.get('*')
+    print(f"{x=}")
     r = await j.result(poll_delay=0)
     assert r == 42
     assert JobStatus.complete == await j.status()
     info = await j.info()
+    print(f"{info=}")
     expected_queue_name = queue_name or arq_redis.default_queue_name
     assert info == JobResult(
         job_try=1,
@@ -90,7 +95,8 @@ async def test_enqueue_job(arq_redis: ArqRedis, worker, queue_name=default_queue
         score=None,
         queue_name=expected_queue_name,
     )
-    results = await arq_redis.all_job_results()
+    results = await arq_redis.all_job_results(queue_name=queue_name)
+    print(f"{results=}")
     assert results == [
         JobResult(
             function='foobar',
@@ -186,7 +192,7 @@ async def test_deserialize_result(arq_redis: ArqRedis, worker):
     assert await j.result(poll_delay=0) == 3
     info = await j.info()
     assert info.args == (1, 2)
-    await arq_redis.set(result_key_prefix + j.job_id, b'invalid pickle data')
+    await arq_redis.set(default_result_key_suffix + j.job_id, b'invalid pickle data')
     with pytest.raises(DeserializationError, match='unable to deserialize job result'):
         assert await j.result(poll_delay=0) == 3
 
@@ -194,7 +200,7 @@ async def test_deserialize_result(arq_redis: ArqRedis, worker):
 async def test_deserialize_info(arq_redis: ArqRedis):
     j = await arq_redis.enqueue_job('foobar', 1, 2)
     assert JobStatus.queued == await j.status()
-    await arq_redis.set(job_key_prefix + j.job_id, b'invalid pickle data')
+    await arq_redis.set(default_job_key_suffix + j.job_id, b'invalid pickle data')
 
     with pytest.raises(DeserializationError, match='unable to deserialize job'):
         assert await j.info()
@@ -214,7 +220,7 @@ async def test_get_job_result(arq_redis: ArqRedis):
 async def test_result_pole_delay_dep(arq_redis: ArqRedis):
     j = Job('foobar', arq_redis)
     r = serialize_result('foobar', (1,), {}, 1, 123, True, 42, 123, 123, 'testing', 'test-queue')
-    await arq_redis.set(result_key_prefix + j.job_id, r)
+    await arq_redis.set(default_result_key_suffix + j.job_id, r)
     with pytest.warns(
         DeprecationWarning, match='"pole_delay" is deprecated, use the correct spelling "poll_delay" instead'
     ):

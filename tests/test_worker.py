@@ -11,7 +11,7 @@ import msgpack
 import pytest
 
 from arq.connections import ArqRedis, RedisSettings
-from arq.constants import abort_jobs_ss, default_queue_name, expires_extra_ms, health_check_key_suffix, job_key_prefix
+from arq.constants import abort_jobs_ss, default_queue_name, expires_extra_ms, health_check_key_suffix, default_job_key_suffix
 from arq.jobs import Job, JobStatus
 from arq.worker import (
     FailedJobs,
@@ -321,7 +321,7 @@ async def test_retry_job_error(arq_redis: ArqRedis, worker, caplog):
 async def test_job_expired(arq_redis: ArqRedis, worker, caplog):
     caplog.set_level(logging.INFO)
     await arq_redis.enqueue_job('foobar', _job_id='testing')
-    await arq_redis.delete(job_key_prefix + 'testing')
+    await arq_redis.delete(default_queue_name + default_job_key_suffix + 'testing')
     worker: Worker = worker(functions=[foobar])
     assert worker.jobs_complete == 0
     assert worker.jobs_failed == 0
@@ -338,7 +338,7 @@ async def test_job_expired(arq_redis: ArqRedis, worker, caplog):
 async def test_job_expired_run_check(arq_redis: ArqRedis, worker, caplog):
     caplog.set_level(logging.INFO)
     await arq_redis.enqueue_job('foobar', _job_id='testing')
-    await arq_redis.delete(job_key_prefix + 'testing')
+    await arq_redis.delete(default_queue_name + default_job_key_suffix + 'testing')
     worker: Worker = worker(functions=[foobar])
     with pytest.raises(FailedJobs) as exc_info:
         await worker.run_check()
@@ -368,7 +368,7 @@ async def test_default_job_expiry(arq_redis: ArqRedis, worker, caplog, extra_job
     if extra_job_expiry is not None:
         arq_redis.expires_extra_ms = extra_job_expiry
     await arq_redis.enqueue_job('foobar', _job_id='testing')
-    time_to_live_ms = await arq_redis.pttl(job_key_prefix + 'testing')
+    time_to_live_ms = await arq_redis.pttl(default_job_key_suffix + default_job_key_suffix + 'testing')
     assert time_to_live_ms == pytest.approx(wait_time)
 
 

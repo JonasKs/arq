@@ -9,7 +9,7 @@ from pytest_mock import MockerFixture
 
 import arq
 from arq import Worker
-from arq.constants import in_progress_key_prefix
+from arq.constants import default_in_progress_key_suffix, default_queue_name
 from arq.cron import cron, next_cron
 
 
@@ -112,7 +112,7 @@ async def test_job_successful(worker, caplog, arq_redis, poll_delay):
     assert '  0.XXs → cron:foobar()\n  0.XXs ← cron:foobar ● 42' in log
 
     # Assert the in-progress key still exists.
-    keys = await arq_redis.keys(in_progress_key_prefix + '*')
+    keys = await arq_redis.keys(default_queue_name + default_in_progress_key_suffix + '*')
     assert len(keys) == 1
     assert await arq_redis.pttl(keys[0]) > 0.0
 

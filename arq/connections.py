@@ -12,7 +12,13 @@ from redis.asyncio import ConnectionPool, Redis
 from redis.asyncio.sentinel import Sentinel
 from redis.exceptions import RedisError, WatchError
 
-from .constants import default_queue_name, expires_extra_ms, job_key_prefix, result_key_prefix
+from .constants import (
+    arq_prefix,
+    default_queue_name,
+    expires_extra_ms,
+    default_job_key_suffix,
+    default_result_key_suffix,
+)
 from .jobs import Deserializer, Job, JobDef, JobResult, Serializer, deserialize_job, serialize_job
 from .utils import timestamp_ms, to_ms, to_unix_ms
 
@@ -102,6 +108,8 @@ class ArqRedis(BaseRedis):
         self.job_serializer = job_serializer
         self.job_deserializer = job_deserializer
         self.default_queue_name = default_queue_name
+        self.job_key_prefix = self.default_queue_name + default_job_key_suffix
+        self.result_key_prefix = self.default_queue_name + default_result_key_suffix
         if pool_or_conn:
             kwargs['connection_pool'] = pool_or_conn
         self.expires_extra_ms = expires_extra_ms
@@ -136,16 +144,21 @@ class ArqRedis(BaseRedis):
         """
         if _queue_name is None:
             _queue_name = self.default_queue_name
+            _job_key_prefix = self.job_key_prefix
+            _result_key_prefix = self.result_key_prefix
+        else:
+            _job_key_prefix = _queue_name + default_job_key_suffix
+            _result_key_prefix = _queue_name + default_result_key_suffix
         job_id = _job_id or uuid4().hex
-        job_key = job_key_prefix + job_id
+        job_key = _job_key_prefix + job_id
         assert not (_defer_until and _defer_by), "use either 'defer_until' or 'defer_by' or neither, not both"
 
         defer_by_ms = to_ms(_defer_by)
         expires_ms = to_ms(_expires)
 
         async with self.pipeline(transaction=True) as pipe:
-            await pipe.watch(job_key)
-            if await pipe.exists(job_key, result_key_prefix + job_id):
+            await pipe.watch(arq_prefix + job_key)
+            if await pipe.exists(arq_prefix + job_key, arq_prefix + _result_key_prefix + job_id):
                 await pipe.reset()
                 return None
 
@@ -161,8 +174,8 @@ class ArqRedis(BaseRedis):
 
             job = serialize_job(function, args, kwargs, _job_try, enqueue_time_ms, serializer=self.job_serializer)
             pipe.multi()
-            pipe.psetex(job_key, expires_ms, job)  # type: ignore[no-untyped-call]
-            pipe.zadd(_queue_name, {job_id: score})  # type: ignore[unused-coroutine]
+            pipe.psetex(arq_prefix + job_key, expires_ms, job)  # type: ignore[no-untyped-call]
+            pipe.zadd(arq_prefix + _queue_name, {job_id: score})  # type: ignore[unused-coroutine]
             try:
                 await pipe.execute()
             except WatchError:
@@ -170,8 +183,8 @@ class ArqRedis(BaseRedis):
                 return None
         return Job(job_id, redis=self, _queue_name=_queue_name, _deserializer=self.job_deserializer)
 
-    async def _get_job_result(self, key: bytes) -> JobResult:
-        job_id = key[len(result_key_prefix) :].decode()
+    async def _get_job_result(self, key: bytes, result_key: str) -> JobResult:
+        job_id = key[len(result_key) :].decode()
         job = Job(job_id, self, _deserializer=self.job_deserializer)
         r = await job.result_info()
         if r is None:
@@ -179,17 +192,26 @@ class ArqRedis(BaseRedis):
         r.job_id = job_id
         return r
 
-    async def all_job_results(self) -> List[JobResult]:
+    async def all_job_results(self, queue_name: Optional[str] = None) -> List[JobResult]:
         """
-        Get results for all jobs in redis.
+        Get results for all jobs in a redis queue.
         """
-        keys = await self.keys(result_key_prefix + '*')
-        results = await asyncio.gather(*[self._get_job_result(k) for k in keys])
+        if queue_name is None:
+            _result_key_prefix = self.result_key_prefix
+        else:
+            _result_key_prefix = queue_name + default_result_key_suffix
+
+        keys = await self.keys(arq_prefix + _result_key_prefix + '*')
+        results = await asyncio.gather(*[self._get_job_result(k, result_key=_result_key_prefix) for k in keys])
         return sorted(results, key=attrgetter('enqueue_time'))
 
-    async def _get_job_def(self, job_id: bytes, score: int) -> JobDef:
-        key = job_key_prefix + job_id.decode()
-        v = await self.get(key)
+    async def _get_job_def(self, job_id: bytes, score: int, queue_name: Optional[str]) -> JobDef:
+        if queue_name is None:
+            _job_key_prefix = self.job_key_prefix
+        else:
+            _job_key_prefix = queue_name + default_job_key_suffix
+        key = _job_key_prefix + job_id.decode()
+        v = await self.get(arq_prefix + key)
         assert v is not None, f'job "{key}" not found'
         jd = deserialize_job(v, deserializer=self.job_deserializer)
         jd.score = score
@@ -201,8 +223,10 @@ class ArqRedis(BaseRedis):
         """
         if queue_name is None:
             queue_name = self.default_queue_name
-        jobs = await self.zrange(queue_name, withscores=True, start=0, end=-1)
-        return await asyncio.gather(*[self._get_job_def(job_id, int(score)) for job_id, score in jobs])
+        jobs = await self.zrange(arq_prefix + queue_name, withscores=True, start=0, end=-1)
+        return await asyncio.gather(
+            *[self._get_job_def(job_id, int(score), queue_name=queue_name) for job_id, score in jobs]
+        )
 
 
 async def create_pool(

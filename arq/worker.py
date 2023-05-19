@@ -19,14 +19,14 @@ from .connections import ArqRedis, RedisSettings, create_pool, log_redis_info
 from .constants import (
     abort_job_max_age,
     abort_jobs_ss,
-    default_queue_name,
+    arq_prefix, default_queue_name,
     expires_extra_ms,
     health_check_key_suffix,
-    in_progress_key_prefix,
-    job_key_prefix,
+    default_in_progress_key_suffix,
+    default_job_key_suffix,
     keep_cronjob_progress,
-    result_key_prefix,
-    retry_key_prefix,
+    default_result_key_suffix,
+    default_retry_key_suffix,
 )
 from .utils import (
     args_to_string,
@@ -224,6 +224,10 @@ class Worker:
             else:
                 raise ValueError('If queue_name is absent, redis_pool must be present.')
         self.queue_name = queue_name
+        self.job_key_prefix = self.queue_name + default_job_key_suffix
+        self.result_key_prefix = self.queue_name + default_result_key_suffix
+        self.in_progress_key_prefix = self.queue_name + default_in_progress_key_suffix
+        self.retry_key_prefix = self.queue_name  + default_retry_key_suffix
         self.cron_jobs: List[CronJob] = []
         if cron_jobs is not None:
             assert all(isinstance(cj, CronJob) for cj in cron_jobs), 'cron_jobs, must be instances of CronJob'
@@ -426,7 +430,7 @@ class Worker:
         for job_id_b in job_ids:
             await self.sem.acquire()
             job_id = job_id_b.decode()
-            in_progress_key = in_progress_key_prefix + job_id
+            in_progress_key = self.in_progress_key_prefix + job_id
             async with self.pool.pipeline(transaction=True) as pipe:
                 await pipe.watch(in_progress_key)
                 ongoing_exists = await pipe.exists(in_progress_key)
@@ -455,9 +459,9 @@ class Worker:
     async def run_job(self, job_id: str, score: int) -> None:  # noqa: C901
         start_ms = timestamp_ms()
         async with self.pool.pipeline(transaction=True) as pipe:
-            pipe.get(job_key_prefix + job_id)  # type: ignore[unused-coroutine]
-            pipe.incr(retry_key_prefix + job_id)  # type: ignore[unused-coroutine]
-            pipe.expire(retry_key_prefix + job_id, 88400)  # type: ignore[unused-coroutine]
+            pipe.get(self.job_key_prefix + job_id)  # type: ignore[unused-coroutine]
+            pipe.incr(self.retry_key_prefix + job_id)  # type: ignore[unused-coroutine]
+            pipe.expire(self.retry_key_prefix + job_id, 88400)  # type: ignore[unused-coroutine]
             if self.allow_abort_jobs:
                 pipe.zrem(abort_jobs_ss, job_id)  # type: ignore[unused-coroutine]
                 v, job_try, _, abort_job = await pipe.execute()
@@ -520,7 +524,7 @@ class Worker:
 
         if enqueue_job_try and enqueue_job_try > job_try:
             job_try = enqueue_job_try
-            await self.pool.setex(retry_key_prefix + job_id, 88400, str(job_try))
+            await self.pool.setex(self.retry_key_prefix + job_id, 88400, str(job_try))
 
         max_tries = self.max_tries if function.max_tries is None else function.max_tries
         if job_try > max_tries:
@@ -665,21 +669,21 @@ class Worker:
     ) -> None:
         async with self.pool.pipeline(transaction=True) as tr:
             delete_keys = []
-            in_progress_key = in_progress_key_prefix + job_id
+            in_progress_key = self.in_progress_key_prefix + job_id
             if keep_in_progress is None:
                 delete_keys += [in_progress_key]
             else:
-                tr.pexpire(in_progress_key, to_ms(keep_in_progress))  # type: ignore[unused-coroutine]
+                tr.pexpire(arq_prefix + in_progress_key, to_ms(keep_in_progress))  # type: ignore[unused-coroutine]
 
             if finish:
                 if result_data:
                     expire = None if keep_result_forever else result_timeout_s
-                    tr.set(result_key_prefix + job_id, result_data, px=to_ms(expire))  # type: ignore[unused-coroutine]
-                delete_keys += [retry_key_prefix + job_id, job_key_prefix + job_id]
-                tr.zrem(abort_jobs_ss, job_id)  # type: ignore[unused-coroutine]
-                tr.zrem(self.queue_name, job_id)  # type: ignore[unused-coroutine]
+                    tr.set(arq_prefix + self.result_key_prefix + job_id, result_data, px=to_ms(expire))  # type: ignore[unused-coroutine]
+                delete_keys += [arq_prefix + self.retry_key_prefix + job_id, arq_prefix + self.job_key_prefix + job_id]
+                tr.zrem(abort_jobs_ss, arq_prefix + job_id)  # type: ignore[unused-coroutine]
+                tr.zrem(arq_prefix + self.queue_name, job_id)  # type: ignore[unused-coroutine]
             elif incr_score:
-                tr.zincrby(self.queue_name, incr_score, job_id)  # type: ignore[unused-coroutine]
+                tr.zincrby(arq_prefix + self.queue_name, incr_score, job_id)  # type: ignore[unused-coroutine]
             if delete_keys:
                 tr.delete(*delete_keys)  # type: ignore[unused-coroutine]
             await tr.execute()
@@ -687,17 +691,17 @@ class Worker:
     async def finish_failed_job(self, job_id: str, result_data: Optional[bytes]) -> None:
         async with self.pool.pipeline(transaction=True) as tr:
             tr.delete(  # type: ignore[unused-coroutine]
-                retry_key_prefix + job_id,
-                in_progress_key_prefix + job_id,
-                job_key_prefix + job_id,
+                arq_prefix + self.retry_key_prefix + job_id,
+                arq_prefix + self.in_progress_key_prefix + job_id,
+                arq_prefix + self.job_key_prefix + job_id,
             )
-            tr.zrem(abort_jobs_ss, job_id)  # type: ignore[unused-coroutine]
-            tr.zrem(self.queue_name, job_id)  # type: ignore[unused-coroutine]
+            tr.zrem(abort_jobs_ss, arq_prefix + job_id)  # type: ignore[unused-coroutine]
+            tr.zrem(arq_prefix + self.queue_name, job_id)  # type: ignore[unused-coroutine]
             # result_data would only be None if serializing the result fails
             keep_result = self.keep_result_forever or self.keep_result_s > 0
             if result_data is not None and keep_result:  # pragma: no branch
                 expire = 0 if self.keep_result_forever else self.keep_result_s
-                tr.set(result_key_prefix + job_id, result_data, px=to_ms(expire))  # type: ignore[unused-coroutine]
+                tr.set(arq_prefix + self.result_key_prefix + job_id, result_data, px=to_ms(expire))  # type: ignore[unused-coroutine]
             await tr.execute()
 
     async def heart_beat(self) -> None:

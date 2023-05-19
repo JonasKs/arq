@@ -9,7 +9,8 @@ from typing import Any, Callable, Dict, Optional, Tuple
 
 from redis.asyncio import Redis
 
-from .constants import abort_jobs_ss, default_queue_name, in_progress_key_prefix, job_key_prefix, result_key_prefix
+from .constants import abort_jobs_ss, arq_prefix, default_queue_name, default_in_progress_key_suffix, \
+    default_job_key_suffix, default_result_key_suffix
 from .utils import ms_to_datetime, poll, timestamp_ms
 
 logger = logging.getLogger('arq.jobs')
@@ -68,7 +69,15 @@ class Job:
     Holds data a reference to a job.
     """
 
-    __slots__ = 'job_id', '_redis', '_queue_name', '_deserializer'
+    __slots__ = (
+        'job_id',
+        '_redis',
+        'queue_name',
+        '_job_key_prefix',
+        '_result_key_prefix',
+        '_in_progress_key_prefix',
+        '_deserializer',
+    )
 
     def __init__(
         self,
@@ -79,7 +88,10 @@ class Job:
     ):
         self.job_id = job_id
         self._redis = redis
-        self._queue_name = _queue_name
+        self.queue_name = _queue_name
+        self._job_key_prefix = _queue_name + default_job_key_suffix
+        self._result_key_prefix = _queue_name + default_result_key_suffix
+        self._in_progress_key_prefix = _queue_name + default_in_progress_key_suffix
         self._deserializer = _deserializer
 
     async def result(
@@ -103,8 +115,8 @@ class Job:
 
         async for delay in poll(poll_delay):
             async with self._redis.pipeline(transaction=True) as tr:
-                tr.get(result_key_prefix + self.job_id)  # type: ignore[unused-coroutine]
-                tr.zscore(self._queue_name, self.job_id)  # type: ignore[unused-coroutine]
+                tr.get(arq_prefix + self.queue_name + self._result_key_prefix + self.job_id)  # type: ignore[unused-coroutine]
+                tr.zscore(arq_prefix + self.queue_name, self.job_id)  # type: ignore[unused-coroutine]
                 v, s = await tr.execute()
 
             if v:
@@ -130,11 +142,11 @@ class Job:
         """
         info: Optional[JobDef] = await self.result_info()
         if not info:
-            v = await self._redis.get(job_key_prefix + self.job_id)
+            v = await self._redis.get(arq_prefix + self.queue_name + self._job_key_prefix + self.job_id)
             if v:
                 info = deserialize_job(v, deserializer=self._deserializer)
         if info:
-            s = await self._redis.zscore(self._queue_name, self.job_id)
+            s = await self._redis.zscore(arq_prefix + self.queue_name, self.job_id)
             info.score = None if s is None else int(s)
         return info
 
@@ -143,7 +155,7 @@ class Job:
         Information about the job result if available, does not wait for the result. Does not raise an exception
         even if the job raised one.
         """
-        v = await self._redis.get(result_key_prefix + self.job_id)
+        v = await self._redis.get(arq_prefix + self._result_key_prefix + self.job_id)
         if v:
             return deserialize_result(v, deserializer=self._deserializer)
         else:
@@ -154,9 +166,9 @@ class Job:
         Status of the job.
         """
         async with self._redis.pipeline(transaction=True) as tr:
-            tr.exists(result_key_prefix + self.job_id)  # type: ignore[unused-coroutine]
-            tr.exists(in_progress_key_prefix + self.job_id)  # type: ignore[unused-coroutine]
-            tr.zscore(self._queue_name, self.job_id)  # type: ignore[unused-coroutine]
+            tr.exists(arq_prefix + self._result_key_prefix + self.job_id)  # type: ignore[unused-coroutine]
+            tr.exists(arq_prefix + self._in_progress_key_prefix + self.job_id)  # type: ignore[unused-coroutine]
+            tr.zscore(arq_prefix + self.queue_name, self.job_id)  # type: ignore[unused-coroutine]
             is_complete, is_in_progress, score = await tr.execute()
 
         if is_complete:
@@ -180,11 +192,11 @@ class Job:
         job_info = await self.info()
         if job_info and job_info.score and job_info.score > timestamp_ms():
             async with self._redis.pipeline(transaction=True) as tr:
-                tr.zrem(self._queue_name, self.job_id)  # type: ignore[unused-coroutine]
-                tr.zadd(self._queue_name, {self.job_id: 1})  # type: ignore[unused-coroutine]
+                tr.zrem(arq_prefix + self.queue_name, self.job_id)  # type: ignore[unused-coroutine]
+                tr.zadd(arq_prefix + self.queue_name, {self.job_id: 1})  # type: ignore[unused-coroutine]
                 await tr.execute()
 
-        await self._redis.zadd(abort_jobs_ss, {self.job_id: timestamp_ms()})
+        await self._redis.zadd(abort_jobs_ss, {arq_prefix + self.job_id: timestamp_ms()})
 
         try:
             await self.result(timeout=timeout, poll_delay=poll_delay)

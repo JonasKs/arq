@@ -1,9 +1,10 @@
-default_queue_name = 'arq:queue'
-job_key_prefix = 'arq:job:'
-in_progress_key_prefix = 'arq:in-progress:'
-result_key_prefix = 'arq:result:'
-retry_key_prefix = 'arq:retry:'
-abort_jobs_ss = 'arq:abort'
+arq_prefix = 'arq:'
+default_queue_name = 'queue'
+default_job_key_suffix = ':job:'
+default_in_progress_key_suffix = ':in-progress:'
+default_result_key_suffix = ':result:'
+default_retry_key_suffix = ':retry:'
+abort_jobs_ss = 'abort'
 # age of items in the abort_key sorted set after which they're deleted
 abort_job_max_age = 60
 health_check_key_suffix = ':health-check'
